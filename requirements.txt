@@ -1,0 +1,3 @@
+# Auto-generated from pyproject.toml [project.dependencies]
+# Used by: pip-audit -r requirements.txt (scoped audit, not system-wide)
+sqlite-vec>=0.1.6
