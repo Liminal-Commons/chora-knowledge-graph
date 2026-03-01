@@ -15,6 +15,15 @@
 """
 
 from chora_knowledge_graph.graph import KnowledgeGraph
-from chora_knowledge_graph.types import InvalidEdgeTypeError, InvalidNodeTypeError
+from chora_knowledge_graph.types import (
+    InvalidEdgeTypeError,
+    InvalidNodeTypeError,
+    NodeNotFoundError,
+)
 
-__all__ = ["KnowledgeGraph", "InvalidNodeTypeError", "InvalidEdgeTypeError"]
+__all__ = [
+    "KnowledgeGraph",
+    "InvalidNodeTypeError",
+    "InvalidEdgeTypeError",
+    "NodeNotFoundError",
+]

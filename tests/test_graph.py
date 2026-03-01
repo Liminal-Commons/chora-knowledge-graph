@@ -17,6 +17,7 @@ from chora_knowledge_graph import (
     InvalidEdgeTypeError,
     InvalidNodeTypeError,
     KnowledgeGraph,
+    NodeNotFoundError,
 )
 
 
@@ -284,3 +285,266 @@ class TestPersistence:
         g = KnowledgeGraph()
         g.add_node("Test", "t1", name="test")
         g.close()
+
+
+# -- Update node ---------------------------------------------------------------
+
+
+class TestUpdateNode:
+    """update_node merges attrs on existing nodes."""
+
+    def test_merge_new_attr(self) -> None:
+        g = KnowledgeGraph()
+        g.add_node("Term", "t1", name="original")
+        g.update_node("t1", description="added later")
+        node = g.get_node("t1")
+        assert node is not None
+        assert node["name"] == "original"
+        assert node["description"] == "added later"
+
+    def test_overwrite_existing_attr(self) -> None:
+        g = KnowledgeGraph()
+        g.add_node("Term", "t1", name="old", version=1)
+        g.update_node("t1", version=2)
+        node = g.get_node("t1")
+        assert node is not None
+        assert node["version"] == 2
+        assert node["name"] == "old"
+
+    def test_updates_fts_index(self) -> None:
+        g = KnowledgeGraph()
+        g.add_node("Term", "t1", name="alpha")
+        g.update_node("t1", name="beta")
+        result = g.search_terms("beta")
+        assert result["match_count"] >= 1
+        assert any(m["id"] == "t1" for m in result["matches"])
+
+    def test_raises_for_missing_node(self) -> None:
+        g = KnowledgeGraph()
+        with pytest.raises(NodeNotFoundError):
+            g.update_node("nonexistent", name="fail")
+
+    def test_preserves_type(self) -> None:
+        g = KnowledgeGraph()
+        g.add_node("Pattern", "p1", name="my pattern")
+        g.update_node("p1", severity="high")
+        node = g.get_node("p1")
+        assert node is not None
+        assert node["type"] == "Pattern"
+
+
+# -- Delete node ---------------------------------------------------------------
+
+
+class TestDeleteNode:
+    """delete_node cascades to edges, FTS, and embeddings."""
+
+    def test_removes_node(self) -> None:
+        g = KnowledgeGraph()
+        g.add_node("Term", "t1", name="test")
+        result = g.delete_node("t1")
+        assert result is True
+        assert g.get_node("t1") is None
+
+    def test_cascades_edges(self) -> None:
+        g = KnowledgeGraph()
+        g.add_node("Term", "t1", name="a")
+        g.add_node("Term", "t2", name="b")
+        g.add_edge("replaces", "t2", "t1")
+        g.delete_node("t1")
+        edges = g.get_edges("t2")
+        assert len(edges) == 0
+
+    def test_removes_from_fts(self) -> None:
+        g = KnowledgeGraph()
+        g.add_node("Term", "t1", name="unicorn")
+        g.delete_node("t1")
+        result = g.search_terms("unicorn")
+        assert result["match_count"] == 0
+
+    def test_removes_embedding(self) -> None:
+        g = KnowledgeGraph()
+        g.add_node("Term", "t1", name="test")
+        g._write_embedding("t1", _make_embedding(768, {0: 1.0}))
+        assert g.embedding_count() == 1
+        g.delete_node("t1")
+        assert g.embedding_count() == 0
+
+    def test_returns_false_for_missing(self) -> None:
+        g = KnowledgeGraph()
+        assert g.delete_node("nonexistent") is False
+
+
+# -- Delete edge ---------------------------------------------------------------
+
+
+class TestDeleteEdge:
+    """delete_edge removes specific edges."""
+
+    def test_removes_edge(self) -> None:
+        g = KnowledgeGraph()
+        g.add_node("Term", "t1", name="a")
+        g.add_node("Term", "t2", name="b")
+        g.add_edge("replaces", "t1", "t2")
+        result = g.delete_edge("t1", "t2", "replaces")
+        assert result is True
+        assert len(g.get_edges("t1")) == 0
+
+    def test_returns_false_for_missing(self) -> None:
+        g = KnowledgeGraph()
+        assert g.delete_edge("x", "y", "z") is False
+
+    def test_preserves_other_edges(self) -> None:
+        g = KnowledgeGraph()
+        g.add_node("Term", "t1", name="a")
+        g.add_node("Term", "t2", name="b")
+        g.add_node("Term", "t3", name="c")
+        g.add_edge("replaces", "t1", "t2")
+        g.add_edge("replaces", "t1", "t3")
+        g.delete_edge("t1", "t2", "replaces")
+        edges = g.get_edges("t1")
+        assert len(edges) == 1
+        assert edges[0]["target"] == "t3"
+
+
+# -- List nodes ----------------------------------------------------------------
+
+
+class TestListNodes:
+    """list_nodes with type and attribute filtering."""
+
+    @pytest.fixture()
+    def populated_graph(self) -> KnowledgeGraph:
+        g = KnowledgeGraph()
+        g.add_node("Term", "t1", name="alpha", domain="auth")
+        g.add_node("Term", "t2", name="beta", domain="auth")
+        g.add_node("Term", "t3", name="gamma", domain="payments")
+        g.add_node("Pattern", "p1", name="singleton", domain="auth")
+        return g
+
+    def test_list_all(self, populated_graph: KnowledgeGraph) -> None:
+        nodes = populated_graph.list_nodes()
+        assert len(nodes) == 4
+
+    def test_filter_by_type(self, populated_graph: KnowledgeGraph) -> None:
+        nodes = populated_graph.list_nodes(node_type="Term")
+        assert len(nodes) == 3
+        assert all(n["type"] == "Term" for n in nodes)
+
+    def test_filter_by_attr(self, populated_graph: KnowledgeGraph) -> None:
+        nodes = populated_graph.list_nodes(domain="auth")
+        assert len(nodes) == 3
+
+    def test_filter_by_type_and_attr(self, populated_graph: KnowledgeGraph) -> None:
+        nodes = populated_graph.list_nodes(node_type="Term", domain="auth")
+        assert len(nodes) == 2
+
+    def test_limit_and_offset(self, populated_graph: KnowledgeGraph) -> None:
+        nodes = populated_graph.list_nodes(limit=2)
+        assert len(nodes) == 2
+        nodes2 = populated_graph.list_nodes(limit=2, offset=2)
+        assert len(nodes2) == 2
+        ids1 = {n["id"] for n in nodes}
+        ids2 = {n["id"] for n in nodes2}
+        assert ids1.isdisjoint(ids2)
+
+
+# -- Walk (BFS traversal) -----------------------------------------------------
+
+
+class TestWalk:
+    """walk performs BFS traversal with cycle detection."""
+
+    @pytest.fixture()
+    def chain_graph(self) -> KnowledgeGraph:
+        g = KnowledgeGraph()
+        g.add_node("Behavior", "b1", name="login")
+        g.add_node("Behavior", "b2", name="user-exists")
+        g.add_node("Behavior", "b3", name="db-connected")
+        g.add_edge("depends_on", "b1", "b2")
+        g.add_edge("depends_on", "b2", "b3")
+        return g
+
+    def test_walks_chain(self, chain_graph: KnowledgeGraph) -> None:
+        result = chain_graph.walk("b1", edge_types=["depends_on"])
+        assert len(result) == 3
+        assert result[0]["node"]["id"] == "b1"
+        assert result[0]["depth"] == 0
+        assert result[1]["node"]["id"] == "b2"
+        assert result[1]["depth"] == 1
+        assert result[2]["node"]["id"] == "b3"
+        assert result[2]["depth"] == 2
+
+    def test_respects_max_depth(self, chain_graph: KnowledgeGraph) -> None:
+        result = chain_graph.walk("b1", edge_types=["depends_on"], max_depth=1)
+        assert len(result) == 2  # root + 1 hop
+
+    def test_handles_cycles(self) -> None:
+        g = KnowledgeGraph()
+        g.add_node("N", "a", name="a")
+        g.add_node("N", "b", name="b")
+        g.add_edge("links", "a", "b")
+        g.add_edge("links", "b", "a")
+        result = g.walk("a", edge_types=["links"])
+        assert len(result) == 2  # visits each once
+
+    def test_returns_empty_for_missing_node(self) -> None:
+        g = KnowledgeGraph()
+        assert g.walk("nonexistent") == []
+
+    def test_incoming_direction(self, chain_graph: KnowledgeGraph) -> None:
+        result = chain_graph.walk("b3", edge_types=["depends_on"], direction="incoming")
+        assert len(result) == 3
+        ids = [r["node"]["id"] for r in result]
+        assert "b3" in ids
+        assert "b2" in ids
+        assert "b1" in ids
+
+    def test_root_only_no_matching_edges(self) -> None:
+        g = KnowledgeGraph()
+        g.add_node("N", "a", name="lonely")
+        result = g.walk("a")
+        assert len(result) == 1
+        assert result[0]["node"]["id"] == "a"
+        assert result[0]["edge"] is None
+
+
+# -- Enhanced get_edges --------------------------------------------------------
+
+
+class TestGetEdgesEnhanced:
+    """get_edges with direction and edge_type filtering."""
+
+    @pytest.fixture()
+    def edge_graph(self) -> KnowledgeGraph:
+        g = KnowledgeGraph()
+        g.add_node("N", "a", name="a")
+        g.add_node("N", "b", name="b")
+        g.add_node("N", "c", name="c")
+        g.add_edge("x", "a", "b")
+        g.add_edge("y", "a", "c")
+        g.add_edge("x", "c", "a")
+        return g
+
+    def test_default_both_directions(self, edge_graph: KnowledgeGraph) -> None:
+        edges = edge_graph.get_edges("a")
+        assert len(edges) == 3  # 2 outgoing + 1 incoming
+
+    def test_outgoing_only(self, edge_graph: KnowledgeGraph) -> None:
+        edges = edge_graph.get_edges("a", direction="outgoing")
+        assert len(edges) == 2
+        assert all(e["source"] == "a" for e in edges)
+
+    def test_incoming_only(self, edge_graph: KnowledgeGraph) -> None:
+        edges = edge_graph.get_edges("a", direction="incoming")
+        assert len(edges) == 1
+        assert edges[0]["source"] == "c"
+
+    def test_filter_by_edge_type(self, edge_graph: KnowledgeGraph) -> None:
+        edges = edge_graph.get_edges("a", edge_type="x")
+        assert len(edges) == 2  # one outgoing (a->b) + one incoming (c->a)
+
+    def test_filter_by_type_and_direction(self, edge_graph: KnowledgeGraph) -> None:
+        edges = edge_graph.get_edges("a", edge_type="x", direction="outgoing")
+        assert len(edges) == 1
+        assert edges[0]["target"] == "b"

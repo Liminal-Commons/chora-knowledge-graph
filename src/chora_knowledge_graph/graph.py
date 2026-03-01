@@ -32,12 +32,16 @@ import math
 import sqlite3
 import struct
 import time
-from collections import Counter
+from collections import Counter, deque
 from typing import Any
 
 import sqlite_vec  # type: ignore[import-untyped]
 
-from chora_knowledge_graph.types import InvalidEdgeTypeError, InvalidNodeTypeError
+from chora_knowledge_graph.types import (
+    InvalidEdgeTypeError,
+    InvalidNodeTypeError,
+    NodeNotFoundError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +70,7 @@ class KnowledgeGraph:
         self._valid_edge_types: frozenset[str] | None = (
             frozenset(valid_edge_types) if valid_edge_types is not None else None
         )
-        self._conn = sqlite3.connect(db_path)
+        self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.enable_load_extension(True)
@@ -205,6 +209,103 @@ class KnowledgeGraph:
         attrs["type"] = row[1]
         return attrs
 
+    def update_node(self, node_id: str, **attrs: Any) -> None:
+        """Update attributes on an existing node (merge semantics).
+
+        New attributes are added; existing attributes with the same key
+        are overwritten.  The node's type is preserved.
+
+        Raises:
+            NodeNotFoundError: If node_id does not exist.
+        """
+        existing = self.get_node(node_id)
+        if existing is None:
+            raise NodeNotFoundError(node_id)
+
+        node_type = existing.pop("type")
+        existing.pop("id")
+        merged = {**existing, **attrs}
+        attrs_json = json.dumps(merged, ensure_ascii=False)
+
+        self._conn.execute(
+            "UPDATE nodes SET attrs = ? WHERE id = ?",
+            (attrs_json, node_id),
+        )
+        self._index_node_fts(node_id, merged)
+        self._conn.commit()
+
+    def delete_node(self, node_id: str) -> bool:
+        """Delete a node and cascade to edges, FTS index, and embeddings.
+
+        Returns:
+            True if the node was deleted, False if it didn't exist.
+        """
+        row = self._conn.execute(
+            "SELECT id FROM nodes WHERE id = ?", (node_id,)
+        ).fetchone()
+        if row is None:
+            return False
+
+        self._conn.execute(
+            "DELETE FROM edges WHERE source = ? OR target = ?",
+            (node_id, node_id),
+        )
+        self._conn.execute("DELETE FROM nodes WHERE id = ?", (node_id,))
+        self._conn.execute("DELETE FROM nodes_fts WHERE node_id = ?", (node_id,))
+        with contextlib.suppress(sqlite3.OperationalError):
+            self._conn.execute(
+                "DELETE FROM node_embeddings WHERE id = ?", (node_id,)
+            )
+        self._conn.commit()
+        return True
+
+    def list_nodes(
+        self,
+        node_type: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+        **filter_attrs: Any,
+    ) -> list[dict[str, Any]]:
+        """List nodes, optionally filtered by type and JSON attributes.
+
+        Args:
+            node_type: Filter to this node type. None = all types.
+            limit: Maximum number of results.
+            offset: Skip this many results.
+            **filter_attrs: Filter by JSON attribute values
+                (e.g. ``domain="auth"``).
+        """
+        conditions: list[str] = []
+        params: list[Any] = []
+
+        if node_type is not None:
+            conditions.append("type = ?")
+            params.append(node_type)
+
+        for key, value in filter_attrs.items():
+            conditions.append(f"json_extract(attrs, '$.{key}') = ?")  # nosec B608
+            params.append(
+                json.dumps(value) if isinstance(value, (dict, list)) else value
+            )
+
+        where = ""
+        if conditions:
+            where = "WHERE " + " AND ".join(conditions)
+
+        params.extend([limit, offset])
+        rows = self._conn.execute(
+            f"SELECT id, type, attrs FROM nodes {where} LIMIT ? OFFSET ?",  # nosec B608
+            params,
+        ).fetchall()
+
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            node: dict[str, Any] = json.loads(row[2])
+            node["id"] = row[0]
+            node["type"] = row[1]
+            results.append(node)
+        return results
+
     # ── Edge operations ──────────────────────────────────────────────
 
     def add_edge(self, edge_type: str, source: str, target: str, **attrs: Any) -> None:
@@ -228,23 +329,55 @@ class KnowledgeGraph:
         )
         self._conn.commit()
 
-    def get_edges(self, node_id: str) -> list[dict[str, Any]]:
-        """Get all edges connected to a node (outgoing and incoming)."""
+    def get_edges(
+        self,
+        node_id: str,
+        edge_type: str | None = None,
+        direction: str = "both",
+    ) -> list[dict[str, Any]]:
+        """Get edges connected to a node.
+
+        Args:
+            node_id: The node to query edges for.
+            edge_type: Filter to this edge type. None = all types.
+            direction: ``"outgoing"``, ``"incoming"``, or ``"both"`` (default).
+        """
         edges: list[dict[str, Any]] = []
 
-        rows = self._conn.execute(
-            "SELECT source, target, type, attrs FROM edges WHERE source = ? OR target = ?",
-            (node_id, node_id),
-        ).fetchall()
+        def _query(where: str, params: tuple[Any, ...]) -> None:
+            rows = self._conn.execute(
+                f"SELECT source, target, type, attrs FROM edges WHERE {where}",  # nosec B608
+                params,
+            ).fetchall()
+            for source, target, etype, attrs_json in rows:
+                edge: dict[str, Any] = json.loads(attrs_json)
+                edge["source"] = source
+                edge["target"] = target
+                edge["type"] = etype
+                edges.append(edge)
 
-        for source, target, edge_type, attrs_json in rows:
-            edge: dict[str, Any] = json.loads(attrs_json)
-            edge["source"] = source
-            edge["target"] = target
-            edge["type"] = edge_type
-            edges.append(edge)
+        if direction in ("outgoing", "both"):
+            if edge_type is not None:
+                _query("source = ? AND type = ?", (node_id, edge_type))
+            else:
+                _query("source = ?", (node_id,))
+
+        if direction in ("incoming", "both"):
+            if edge_type is not None:
+                _query("target = ? AND type = ?", (node_id, edge_type))
+            else:
+                _query("target = ?", (node_id,))
 
         return edges
+
+    def delete_edge(self, source: str, target: str, edge_type: str) -> bool:
+        """Delete a specific edge. Returns False if it didn't exist."""
+        cursor = self._conn.execute(
+            "DELETE FROM edges WHERE source = ? AND target = ? AND type = ?",
+            (source, target, edge_type),
+        )
+        self._conn.commit()
+        return cursor.rowcount > 0
 
     # ── Query operations ─────────────────────────────────────────────
 
@@ -333,6 +466,61 @@ class KnowledgeGraph:
             "nodes": nodes,
             "edges": edges,
         }
+
+    # ── Walk (BFS traversal) ────────────────────────────────────────
+
+    def walk(
+        self,
+        start_id: str,
+        edge_types: list[str] | None = None,
+        direction: str = "outgoing",
+        max_depth: int = 5,
+    ) -> list[dict[str, Any]]:
+        """BFS traversal from a start node.
+
+        Args:
+            start_id: Node ID to start traversal from.
+            edge_types: Edge types to follow. None = all types.
+            direction: ``"outgoing"``, ``"incoming"``, or ``"both"``.
+            max_depth: Maximum traversal depth.
+
+        Returns:
+            Ordered list of ``{node, edge, depth}`` dicts.
+            Root node has ``edge=None`` and ``depth=0``.
+        """
+        start_node = self.get_node(start_id)
+        if start_node is None:
+            return []
+
+        result: list[dict[str, Any]] = [
+            {"node": start_node, "edge": None, "depth": 0}
+        ]
+        visited: set[str] = {start_id}
+        queue: deque[tuple[str, int]] = deque([(start_id, 0)])
+
+        while queue:
+            current_id, depth = queue.popleft()
+            if depth >= max_depth:
+                continue
+
+            for etype in (edge_types or [None]):  # type: ignore[list-item]
+                edges = self.get_edges(current_id, edge_type=etype, direction=direction)
+                for edge in edges:
+                    neighbor_id = (
+                        edge["target"] if direction != "incoming" else edge["source"]
+                    )
+                    if neighbor_id in visited:
+                        continue
+
+                    neighbor = self.get_node(neighbor_id)
+                    if neighbor is None:
+                        continue
+
+                    visited.add(neighbor_id)
+                    result.append({"node": neighbor, "edge": edge, "depth": depth + 1})
+                    queue.append((neighbor_id, depth + 1))
+
+        return result
 
     # ── Search operations ────────────────────────────────────────────
 

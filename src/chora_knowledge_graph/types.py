@@ -19,3 +19,11 @@ class InvalidEdgeTypeError(ValueError):
         super().__init__(
             f"Invalid edge type '{edge_type}'. Valid types: {sorted(valid_types)}"
         )
+
+
+class NodeNotFoundError(KeyError):
+    """Raised when a node is not found in the graph."""
+
+    def __init__(self, node_id: str) -> None:
+        super().__init__(f"Node not found: '{node_id}'")
+        self.node_id = node_id
